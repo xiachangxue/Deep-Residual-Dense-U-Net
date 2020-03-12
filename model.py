@@ -8,29 +8,15 @@ import time
 from PIL import Image
 import keras
 from keras.models import *
-from keras.layers import Input, Conv2D,  UpSampling2D, BatchNormalization, Activation, add, concatenate
+from keras.layers import Input, add, Conv2D, MaxPooling2D, UpSampling2D, BatchNormalization, Activation, Add,Concatenate, concatenate, Dropout
 from keras.optimizers import *
-from keras.callbacks import ModelCheckpoint
+from keras.callbacks import ModelCheckpoint, LearningRateScheduler
+from keras import backend as keras
+
 
 BATCH_SIZE = 2
-KERNEL_SIZE = 3
-
-def res_block(x, nb_filters, strides):
-    res_path = BatchNormalization()(x)
-    res_path = Activation(activation='relu')(res_path)
-    res_path = Conv2D(filters=nb_filters[0], kernel_size=(3, 3), padding='same', strides=strides[0])(res_path)
-    res_path = BatchNormalization()(res_path)
-    res_path = Activation(activation='relu')(res_path)
-    res_path = Conv2D(filters=nb_filters[1], kernel_size=(3, 3), padding='same', strides=strides[1])(res_path)
-
-    shortcut = Conv2D(nb_filters[1], kernel_size=(1, 1), strides=strides[0])(x)
-    shortcut = BatchNormalization()(shortcut)
-
-    res_path = add([shortcut, res_path])
-    return res_path
-
 class Model:
-	def _conv_layer(self, name, input_var, stride, in_channels, out_channels, options = {}):
+	def _conv_layer(self, name, input_var,KERNEL_SIZE, stride, in_channels, out_channels, options = {}):
 		activation = options.get('activation', 'relu')
 		dropout = options.get('dropout', None)
 		padding = options.get('padding', 'SAME')
@@ -91,8 +77,35 @@ class Model:
 			else:
 				raise Exception('invalid activation {} specified'.format(activation))
 
+	def RDBlocks(self, x, name, g):
+		## 6 layers of RDB block
+		## this thing need to be in a damn loop for more customisability
+		li = [x]
+		count = 2
+		x_input = Conv2D(filters=g, kernel_size=(3, 3), strides=(1, 1), padding='same', activation='relu',
+						 name=name + '_conv1_1')(x)
+		pas = Conv2D(filters=g, kernel_size=(3, 3), strides=(1, 1), padding='same', activation='relu',
+					 name=name + '_conv1')(x)
+
+		for i in range(2, count + 1):
+			li.append(pas)
+			out = Concatenate(axis=self.channel_axis)(li)  # conctenated out put
+			pas = Conv2D(filters=g, kernel_size=(3, 3), strides=(1, 1), padding='same', activation='relu',
+						 name=name + '_conv' + str(i))(out)
+
+		# feature extractor from the dense net
+		li.append(pas)
+		out = Concatenate(axis=self.channel_axis)(li)
+		feat = Conv2D(filters=g, kernel_size=(1, 1), strides=(1, 1), padding='same', activation='relu',
+					  name=name + '_Local_Conv')(out)
+
+		feat = Add()([feat, x_input])
+		return feat
+
+
 	def __init__(self, big=False):
 		tf.reset_default_graph()
+		self.channel_axis = 3
 
 		self.is_training = tf.placeholder(tf.bool)
 		if big:
@@ -104,50 +117,38 @@ class Model:
 		self.learning_rate = tf.placeholder(tf.float32)
 
 		self.dropout_factor = tf.to_float(self.is_training) * 0.3
-
-		to_decoder = []
-
 		## encoder
-		main_path = Conv2D(filters=64, kernel_size=(3, 3), padding='same', strides=(1, 1))(self.inputs)
-		main_path = BatchNormalization()(main_path)
-		main_path = Activation(activation='relu')(main_path)
+		self.layer1 = self._conv_layer('layer1', self.inputs, 3, 1, 3, 32, {'activation':'relu','batchnorm': True})#256*256
+		#self.layer2 = self._conv_layer('layer2', self.layer1, 3, 1, 16, 32, {'batchnorm': False})
+		self.layer3 = self._conv_layer('layer3', self.layer1, 3, 1, 32, 32, {'batchnorm': True})
+		#self.layer4_inputs = tf.add(self.layer3, self.layer1)
+		self.layer4 = self.RDBlocks(self.layer3, 'RDB1', 32)#256*256
+		self.layer5 = self._conv_layer('layer5', self.layer4, 3, 2, 32, 64, {'batchnorm': True})#128*128
+		self.layer6 = self.RDBlocks(self.layer5, 'RDB2', 64)#128*128
+		self.layer7 = self._conv_layer('layer7', self.layer6, 3, 2, 64, 128, {'batchnorm': True})#64*64
+		self.layer8 = self.RDBlocks(self.layer7, 'RDB3', 128)#64*64
+		self.layer9 = self._conv_layer('layer9', self.layer8, 3, 2, 128, 256, {'batchnorm': True})#32*32
 
-		main_path = Conv2D(filters=64, kernel_size=(3, 3), padding='same', strides=(1, 1))(main_path)
+		## bridge
+		self.layer10 = self.RDBlocks(self.layer9, 'RDB4', 256)
 
-		shortcut = Conv2D(filters=64, kernel_size=(1, 1), strides=(1, 1))(main_path)
-		shortcut = BatchNormalization()(shortcut)
+		## decoder
+		self.layer11 = self._conv_layer('layer11', self.layer10, 3, 2, 256, 128, {'transpose': True})
+		self.layer12_inputs = tf.concat([self.layer11, self.layer8], axis=3)
+		self.layer12 = self.RDBlocks(self.layer12_inputs, 'RDB5', 128)
+		self.layer13 = self._conv_layer('layer13', self.layer12, 3, 2, 128, 64, {'transpose': True})
+		self.layer14_inputs = tf.concat([self.layer13, self.layer6], axis=3)
+		self.layer14 = self.RDBlocks(self.layer14_inputs, 'RDB6', 64)
+		self.layer15 = self._conv_layer('layer15', self.layer14, 3, 2, 64, 32, {'transpose': True})
+		self.layer16_inputs = tf.concat([self.layer15, self.layer4], axis=3)
+		self.layer16 = self.RDBlocks(self.layer16_inputs, 'RDB7',  64)
+		#self.layer17 = self._conv_layer('layer17', self.layer16, 3, 1, 64, 64, { 'batchnorm': False})
 
-		main_path = add([shortcut, main_path])
-		# first branching to decoder
-		to_decoder.append(main_path)
-
-		main_path = res_block(main_path, [128, 128], [(2, 2), (1, 1)])
-		to_decoder.append(main_path)
-
-		main_path = res_block(main_path, [256, 256], [(2, 2), (1, 1)])
-		to_decoder.append(main_path)
-
-		## res_block
-		main_path = res_block(to_decoder[2], [512, 512], [(2, 2), (1, 1)])
-
-		##decoder
-		main_path = UpSampling2D(size=(2, 2))(main_path)
-		main_path = concatenate([main_path, to_decoder[2]], axis=3)
-		main_path = res_block(main_path, [256, 256], [(1, 1), (1, 1)])
-
-		main_path = UpSampling2D(size=(2, 2))(main_path)
-		main_path = concatenate([main_path, to_decoder[1]], axis=3)
-		main_path = res_block(main_path, [128, 128], [(1, 1), (1, 1)])
-
-		main_path = UpSampling2D(size=(2, 2))(main_path)
-		main_path = concatenate([main_path, to_decoder[0]], axis=3)
-		main_path = res_block(main_path, [64, 64], [(1, 1), (1, 1)])
-
-		self.pre_outputs = self._conv_layer('pre_outputs', main_path, 1, 64, 2, {'activation': 'none', 'batchnorm': False}) # -> 256x256x2
+		self.pre_outputs = self._conv_layer('pre_outputs', self.layer16, 1, 1, 64, 2, {'activation': 'none', 'batchnorm': False}) # -> 256x256x2
 
 		self.outputs = tf.nn.softmax(self.pre_outputs)[:, :, :, 0]
 		self.labels = tf.concat([self.targets, 1 - self.targets], axis=3)
-		self.loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=self.labels, logits=self.pre_outputs))
+		self.loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(labels=self.labels, logits=self.pre_outputs))
 
 		with tf.control_dependencies(tf.get_collection(tf.GraphKeys.UPDATE_OPS)):
 			self.optimizer = tf.train.AdamOptimizer(learning_rate=self.learning_rate).minimize(self.loss)
